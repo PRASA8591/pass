@@ -1,0 +1,22 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId}/entries/{entryId} {
+      allow read, delete: if isOwner(userId);
+      allow create, update: if isOwner(userId) && validEntry(request.resource.data);
+    }
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    function validEntry(data) {
+      return data.keys().hasOnly(['label', 'username', 'password', 'remark', 'createdAt', 'updatedAt'])
+        && data.label is string && data.label.size() > 0 && data.label.size() <= 160
+        && data.username is string && data.username.size() > 0 && data.username.size() <= 160
+        && data.password is string && data.password.size() > 0 && data.password.size() <= 500
+        && data.remark is string && data.remark.size() <= 500;
+    }
+  }
+}
