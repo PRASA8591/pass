@@ -13,10 +13,10 @@ service cloud.firestore {
 
     function validEntry(data) {
       return data.keys().hasOnly(['label', 'username', 'password', 'remark', 'createdAt', 'updatedAt'])
-        && data.label is string && data.label.size() > 0 && data.label.size() <= 160
-        && data.username is string && data.username.size() > 0 && data.username.size() <= 160
-        && data.password is string && data.password.size() > 0 && data.password.size() <= 500
-        && data.remark is string && data.remark.size() <= 500;
+        && data.label is string && data.label.size() > 0 && data.label.size() <= 2048
+        && data.username is string && data.username.size() > 0 && data.username.size() <= 2048
+        && data.password is string && data.password.size() > 0 && data.password.size() <= 2048
+        && data.remark is string && data.remark.size() <= 2048;
     }
   }
 }
