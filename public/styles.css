@@ -12,8 +12,11 @@ button, input, textarea { font: inherit; } button { cursor: pointer; } a { color
 .auth-card h1 span, .brand > span span { color: var(--teal); }
 .eyebrow, .stat-label { color: #91a1b4; font-size: .7rem; font-weight: 900; letter-spacing: .12em; margin: 0 0 .8rem; text-transform: uppercase; }
 .auth-card h2 { font-size: 1.6rem; margin: 0 0 .3rem; }.muted { color: var(--muted); font-size: .92rem; line-height: 1.6; margin: 0; }
+.auth-box { display: block; margin-top: 1.5rem; text-align: left; }
 .auth-card form { margin-top: 1.7rem; text-align: left; }.auth-card label, .modal-card label { color: #71849b; display: block; font-size: .72rem; font-weight: 900; margin-bottom: 1.15rem; text-align: left; text-transform: uppercase; }
 input, textarea { background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 10px; color: var(--ink); display: block; font-size: .9rem; margin-top: .5rem; outline: none; padding: 1rem .9rem; transition: border .2s, box-shadow .2s; width: 100%; }
+.qr-wrap { background: rgba(255,255,255,.7); border: 1px solid var(--line); border-radius: 18px; display: flex; justify-content: center; margin: 1.2rem auto 1rem; padding: 1rem; width: min(100%, 260px); }
+.qr-image { display: block; height: auto; max-width: 220px; width: 100%; }
 input::placeholder, textarea::placeholder { color: #a5b2c1; } input:focus, textarea:focus { border-color: #72cbb2; box-shadow: 0 0 0 3px rgba(6, 161, 118, .12); } textarea { min-height: 6rem; resize: vertical; }
 .primary-button { align-items: center; background: linear-gradient(135deg, var(--teal), var(--teal-dark)); border: 0; border-radius: 12px; box-shadow: 0 10px 20px rgba(12,165,126,.22); color: #fff; display: inline-flex; font-size: .88rem; font-weight: 900; gap: .7rem; justify-content: center; padding: 1rem 1.15rem; text-transform: uppercase; transition: transform .2s ease, box-shadow .2s ease, filter .2s ease; }
 .primary-button:hover { filter: brightness(1.04); transform: translateY(-1px); box-shadow: 0 12px 24px rgba(12,165,126,.3); }

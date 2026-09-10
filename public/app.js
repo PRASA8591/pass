@@ -1,24 +1,16 @@
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js';
-import { getAnalytics } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-analytics.js';
-import {
-  getAuth,
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  signOut,
-  setPersistence,
-  browserLocalPersistence,
-} from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-auth.js';
 import {
   getFirestore,
   collection,
-  addDoc,
   getDocs,
   getDoc,
-  doc,
+  addDoc,
+  setDoc,
   updateDoc,
   deleteDoc,
-  serverTimestamp,
+  doc,
+  query,
+  where,
 } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js';
 
 const firebaseConfig = {
@@ -32,18 +24,8 @@ const firebaseConfig = {
 };
 
 const firebaseApp = initializeApp(firebaseConfig);
-try {
-  getAnalytics(firebaseApp);
-} catch (_error) {
-  // analytics is not required for the vault to work locally
-}
-
-const auth = getAuth(firebaseApp);
 const db = getFirestore(firebaseApp);
-const dexieDb = new Dexie('passvault-local');
-dexieDb.version(1).stores({
-  entries: '++id, userId, label, username, password, remark, createdAt, updatedAt, lastViewedAt',
-});
+const usersRef = collection(db, 'users');
 
 const $ = (selector) => document.querySelector(selector);
 const authView = $('#auth-view');
@@ -52,136 +34,154 @@ const authContent = $('#auth-content');
 const themeKey = 'pass-theme';
 
 const state = {
-  masterPassword: '',
   user: null,
+  authTimer: null,
+  pendingLogin: null,
+  pendingSetup: null,
 };
 
-let entries = [];
-let editingId = null;
 let authMode = 'login';
+const entries = [];
+let editingId = null;
 
-const usernameEmail = (username) =>
-  `${username.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '-')}@mypassword-5e734.firebaseapp.com`;
+const normalizeUsername = (value) => String(value || '').trim().toLowerCase();
+const safeText = (value) => String(value ?? '');
 
-const readableAuthError = (error) => ({
-  'auth/invalid-credential': 'Username or password is incorrect.',
-  'auth/email-already-in-use': 'That username is already in use.',
-  'auth/weak-password': 'Use a password of at least 10 characters.',
-}[error.code] || 'Could not complete that request.');
-
-const entriesRef = () => collection(db, 'users', auth.currentUser.uid, 'entries');
-
-function toBase64(bytes) {
-  let binary = '';
-  bytes.forEach((byte) => {
-    binary += String.fromCharCode(byte);
-  });
-  return btoa(binary);
+function formatDisplayDate(value) {
+  if (!value) return 'Never';
+  const date = value?.toDate ? value.toDate() : new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Never';
+  return new Intl.DateTimeFormat('en-US', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date);
 }
 
-function fromBase64(value) {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
-}
-
-async function deriveKey(masterPassword, saltBytes) {
-  const imported = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(masterPassword),
-    'PBKDF2',
-    false,
-    ['deriveKey']
-  );
-
-  return crypto.subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt: saltBytes,
-      iterations: 200000,
-      hash: 'SHA-256',
-    },
-    imported,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-async function encryptSecret(value, masterPassword) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(masterPassword, salt);
-  const cipher = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    new TextEncoder().encode(value)
-  );
-
+function normalizeEntry(record) {
   return {
-    salt: toBase64(salt),
-    iv: toBase64(iv),
-    ct: toBase64(new Uint8Array(cipher)),
+    ...record,
+    label: safeText(record.label),
+    username: safeText(record.username),
+    password: safeText(record.password),
+    remark: safeText(record.remark),
+    lastViewedAt: record.lastViewedAt || null,
+    updatedAt: record.updatedAt || record.createdAt || null,
   };
 }
 
-async function decryptSecret(payload, masterPassword) {
-  if (!payload || typeof payload !== 'object') return '';
-
-  const salt = fromBase64(payload.salt || '');
-  const iv = fromBase64(payload.iv || '');
-  const ct = fromBase64(payload.ct || '');
-
-  if (!salt.length || !iv.length || !ct.length) return '';
-
-  try {
-    const key = await deriveKey(masterPassword, salt);
-    const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
-    return new TextDecoder().decode(decrypted);
-  } catch (_error) {
-    return '';
+function hexToBytes(hex) {
+  const clean = hex.replace(/\s+/g, '');
+  const buffer = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < clean.length; i += 2) {
+    buffer[i / 2] = Number.parseInt(clean.slice(i, i + 2), 16);
   }
+  return buffer;
 }
 
-async function encryptEntryRecord(entry, masterPassword) {
-  const encrypted = { ...entry };
-  for (const field of ['label', 'username', 'password', 'remark']) {
-    const value = typeof entry[field] === 'string' ? entry[field] : '';
-    if (value) {
-      encrypted[field] = await encryptSecret(value, masterPassword);
-    } else {
-      encrypted[field] = { salt: '', iv: '', ct: '' };
+async function derivePasswordHash(password, saltBytes) {
+  const textEncoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', textEncoder.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const derivedBits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: saltBytes, iterations: 200000, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  return Array.from(new Uint8Array(derivedBits)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function base32Encode(bytes) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = 0;
+  let value = 0;
+  let output = '';
+
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
     }
   }
-  return encrypted;
+
+  if (bits > 0) {
+    output += alphabet[(value << (5 - bits)) & 31];
+  }
+
+  return output;
 }
 
-async function decryptEntryRecord(entry, masterPassword) {
-  const decrypted = { ...entry };
-  for (const field of ['label', 'username', 'password', 'remark']) {
-    if (entry[field] && typeof entry[field] === 'object' && entry[field].ct) {
-      decrypted[field] = await decryptSecret(entry[field], masterPassword);
-    } else {
-      decrypted[field] = typeof entry[field] === 'string' ? entry[field] : '';
+function base32Decode(secret) {
+  const compact = String(secret || '').toUpperCase().replace(/=+$/g, '').replace(/[^A-Z2-7]/g, '');
+  if (!compact) return new Uint8Array();
+
+  let bits = 0;
+  let value = 0;
+  const bytes = [];
+
+  for (const char of compact) {
+    const index = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'.indexOf(char);
+    if (index < 0) continue;
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((value >>> bits) & 255);
     }
   }
-  return decrypted;
+
+  return new Uint8Array(bytes);
 }
 
-function clearMemorySession() {
-  state.masterPassword = '';
-  state.user = null;
-  entries = [];
-  editingId = null;
+function getTotpSecret() {
+  const secretBytes = crypto.getRandomValues(new Uint8Array(20));
+  return base32Encode(secretBytes);
+}
+
+async function getTotpCode(secret, timestampMs = Date.now()) {
+  const keyBytes = base32Decode(secret);
+  if (!keyBytes.length) return '000000';
+
+  const counter = BigInt(Math.floor(timestampMs / 30000));
+  const buffer = new ArrayBuffer(8);
+  const view = new DataView(buffer);
+  let value = counter;
+  for (let i = 7; i >= 0; i -= 1) {
+    view.setUint8(i, Number(value & 0xFFn));
+    value >>= 8n;
+  }
+
+  const cryptoKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const hash = new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, buffer));
+  const offset = hash[hash.length - 1] & 0x0f;
+  const binary = ((hash[offset] & 0x7f) << 24) | ((hash[offset + 1] & 0xff) << 16) | ((hash[offset + 2] & 0xff) << 8) | (hash[offset + 3] & 0xff);
+  const code = (binary % 1000000).toString().padStart(6, '0');
+  return code;
+}
+
+async function verifyTotp(secret, code, drift = 2) {
+  if (!secret || !code) return false;
+  const cleanCode = String(code).replace(/\D/g, '').slice(0, 6);
+  if (!cleanCode) return false;
+
+  for (let offset = -drift; offset <= drift; offset += 1) {
+    const candidate = await getTotpCode(secret, Date.now() + offset * 30000);
+    if (candidate === cleanCode.padStart(6, '0')) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function makeTotpUri(username, secret) {
+  if (!secret) return '';
+  return `otpauth://totp/PassVault:${encodeURIComponent(username)}?secret=${encodeURIComponent(secret)}&issuer=${encodeURIComponent('PassVault')}`;
 }
 
 function applyTheme(theme) {
   const nextTheme = theme === 'dark' ? 'dark' : 'light';
   document.body.dataset.theme = nextTheme;
-
   const toggle = $('#theme-toggle');
   if (!toggle) return;
 
@@ -216,60 +216,118 @@ function initializeTheme() {
   });
 }
 
-function renderAuthForm() {
-  authContent.replaceChildren();
+async function findUserByUsername(username) {
+  const normalized = normalizeUsername(username);
+  const userDoc = await getDoc(doc(db, 'users', normalized));
+  if (!userDoc.exists()) return null;
+  return { id: userDoc.id, ...userDoc.data() };
+}
 
-  const intro = document.createElement('div');
-  intro.className = 'auth-intro';
+async function ensureUserExists(username) {
+  const existing = await findUserByUsername(username);
+  return existing;
+}
 
-  const eyebrow = document.createElement('p');
-  eyebrow.className = 'eyebrow';
-  eyebrow.textContent = authMode === 'setup' ? 'FIRST-TIME SETUP' : 'WELCOME BACK';
+function clearUserSession() {
+  state.user = null;
+  state.pendingLogin = null;
+  state.pendingSetup = null;
+  if (state.authTimer) {
+    clearTimeout(state.authTimer);
+    state.authTimer = null;
+  }
+  entries.length = 0;
+  editingId = null;
+  appView.classList.add('hidden');
+  authView.classList.remove('hidden');
+}
 
-  const title = document.createElement('h2');
-  title.textContent = authMode === 'setup' ? 'Create your vault' : 'Unlock your vault';
+function startAutoLogout() {
+  if (state.authTimer) clearTimeout(state.authTimer);
+  state.authTimer = setTimeout(() => {
+    clearUserSession();
+    showAuth('login');
+    const errorBox = $('#auth-error');
+    if (errorBox) {
+      errorBox.textContent = 'Session expired after 3 minutes. Please sign in again.';
+    }
+  }, 180000);
+}
 
-  const muted = document.createElement('p');
-  muted.className = 'muted';
-  muted.textContent = authMode === 'setup'
-    ? 'Create your secure vault and protect every saved password.'
-    : 'Use your Firebase account and master password to unlock the vault.';
+function registerSessionActivity() {
+  if (state.user) startAutoLogout();
+}
 
-  intro.append(eyebrow, title, muted);
+window.addEventListener('click', registerSessionActivity);
+window.addEventListener('keydown', registerSessionActivity);
+window.addEventListener('mousemove', registerSessionActivity);
+
+function showAuth(mode = 'login') {
+  authMode = mode;
+  authView.classList.remove('hidden');
+  appView.classList.add('hidden');
+  authContent.innerHTML = '';
+
+  if (mode === 'login') {
+    renderLoginView();
+  } else if (mode === 'create') {
+    renderCreateView();
+  } else if (mode === 'otp-setup') {
+    renderOtpSetupView(state.pendingSetup || {});
+  } else if (mode === 'otp-login') {
+    renderOtpLoginView(state.pendingLogin || {});
+  }
+}
+
+async function loadEntries() {
+  if (!state.user) return;
+
+  const entriesRef = collection(db, 'users', state.user.id, 'entries');
+  const snapshot = await getDocs(entriesRef);
+  const loaded = snapshot.docs.map((docSnap) => normalizeEntry({ id: docSnap.id, ...docSnap.data() }));
+
+  entries.splice(0, entries.length, ...loaded);
+  renderEntries();
+  const total = $('#total-count');
+  const lastUpdated = $('#last-updated');
+  if (total) total.textContent = String(entries.length);
+
+  if (entries.length) {
+    const newest = entries
+      .map((entry) => entry.updatedAt || entry.createdAt)
+      .sort((left, right) => Number(new Date(right)) - Number(new Date(left)))[0];
+    if (lastUpdated) lastUpdated.textContent = formatDisplayDate(newest);
+  } else if (lastUpdated) {
+    lastUpdated.textContent = '—';
+  }
+}
+
+function renderLoginView() {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'auth-box';
+
+  const heading = document.createElement('h2');
+  heading.textContent = 'Sign in to your vault';
 
   const form = document.createElement('form');
-  form.id = 'auth-form';
+  form.id = 'login-form';
 
-  const usernameLabel = document.createElement('label');
-  usernameLabel.textContent = 'Username';
+  const usernameField = document.createElement('label');
+  usernameField.textContent = 'Username';
   const usernameInput = document.createElement('input');
   usernameInput.name = 'username';
   usernameInput.required = true;
-  usernameInput.autocomplete = 'username';
-  usernameInput.placeholder = 'admin';
-  usernameLabel.appendChild(usernameInput);
+  usernameInput.placeholder = 'username';
+  usernameField.appendChild(usernameInput);
 
-  const firebasePasswordLabel = document.createElement('label');
-  firebasePasswordLabel.textContent = 'Firebase password';
-  const firebasePasswordInput = document.createElement('input');
-  firebasePasswordInput.name = 'firebasePassword';
-  firebasePasswordInput.type = 'password';
-  firebasePasswordInput.required = true;
-  firebasePasswordInput.minLength = 10;
-  firebasePasswordInput.autocomplete = authMode === 'setup' ? 'new-password' : 'current-password';
-  firebasePasswordInput.placeholder = 'At least 10 characters';
-  firebasePasswordLabel.appendChild(firebasePasswordInput);
-
-  const masterPasswordLabel = document.createElement('label');
-  masterPasswordLabel.textContent = 'Master password';
-  const masterPasswordInput = document.createElement('input');
-  masterPasswordInput.name = 'masterPassword';
-  masterPasswordInput.type = 'password';
-  masterPasswordInput.required = true;
-  masterPasswordInput.minLength = 10;
-  masterPasswordInput.autocomplete = 'off';
-  masterPasswordInput.placeholder = 'Stored only in memory';
-  masterPasswordLabel.appendChild(masterPasswordInput);
+  const passwordField = document.createElement('label');
+  passwordField.textContent = 'Password';
+  const passwordInput = document.createElement('input');
+  passwordInput.name = 'password';
+  passwordInput.type = 'password';
+  passwordInput.required = true;
+  passwordInput.placeholder = 'Your password';
+  passwordField.appendChild(passwordInput);
 
   const errorText = document.createElement('p');
   errorText.id = 'auth-error';
@@ -278,219 +336,338 @@ function renderAuthForm() {
   const submit = document.createElement('button');
   submit.type = 'submit';
   submit.className = 'primary-button full-button';
-  submit.innerHTML = `${authMode === 'setup' ? 'Create secure vault' : 'Unlock vault'} <span>→</span>`;
+  submit.innerHTML = 'Login <span>→</span>';
 
-  form.append(usernameLabel, firebasePasswordLabel, masterPasswordLabel, errorText, submit);
-  form.addEventListener('submit', handleAuth);
+  form.append(usernameField, passwordField, errorText, submit);
+  form.addEventListener('submit', handleLoginSubmit);
 
   const switchButton = document.createElement('button');
   switchButton.type = 'button';
   switchButton.className = 'switch-button';
-  switchButton.textContent = authMode === 'setup' ? 'Already have a vault? Sign in' : 'First time here? Create a vault';
-  switchButton.addEventListener('click', () => {
-    authMode = authMode === 'setup' ? 'login' : 'setup';
-    renderAuthForm();
-  });
+  switchButton.textContent = 'Create account';
+  switchButton.addEventListener('click', () => showAuth('create'));
 
-  const securityNote = document.createElement('p');
-  securityNote.className = 'security-note';
-  securityNote.innerHTML = '<span>✦</span> Encryption runs in your browser using a PBKDF2-derived key that stays in memory only.';
-
-  authContent.append(intro, form, switchButton, securityNote);
+  wrapper.append(heading, form, switchButton);
+  authContent.appendChild(wrapper);
 }
 
-function showAuth(mode = 'login') {
-  authMode = mode;
-  renderAuthForm();
+function renderCreateView() {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'auth-box';
+
+  const heading = document.createElement('h2');
+  heading.textContent = 'Create a secure account';
+
+  const form = document.createElement('form');
+  form.id = 'create-form';
+
+  const usernameField = document.createElement('label');
+  usernameField.textContent = 'Username';
+  const usernameInput = document.createElement('input');
+  usernameInput.name = 'username';
+  usernameInput.required = true;
+  usernameInput.placeholder = 'choose a username';
+  usernameField.appendChild(usernameInput);
+
+  const passwordField = document.createElement('label');
+  passwordField.textContent = 'Password';
+  const passwordInput = document.createElement('input');
+  passwordInput.name = 'password';
+  passwordInput.type = 'password';
+  passwordInput.required = true;
+  passwordInput.minLength = 8;
+  passwordInput.placeholder = 'minimum 8 characters';
+  passwordField.appendChild(passwordInput);
+
+  const errorText = document.createElement('p');
+  errorText.id = 'auth-error';
+  errorText.className = 'form-error';
+
+  const submit = document.createElement('button');
+  submit.type = 'submit';
+  submit.className = 'primary-button full-button';
+  submit.innerHTML = 'Create account <span>→</span>';
+
+  form.append(usernameField, passwordField, errorText, submit);
+  form.addEventListener('submit', handleCreateSubmit);
+
+  const switchButton = document.createElement('button');
+  switchButton.type = 'button';
+  switchButton.className = 'switch-button';
+  switchButton.textContent = 'Back to login';
+  switchButton.addEventListener('click', () => showAuth('login'));
+
+  wrapper.append(heading, form, switchButton);
+  authContent.appendChild(wrapper);
 }
 
-async function handleAuth(event) {
+function renderOtpSetupView(data) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'auth-box';
+
+  const title = document.createElement('h2');
+  title.textContent = 'Set up Google Authenticator';
+
+  const description = document.createElement('p');
+  description.className = 'muted';
+  description.textContent = 'Scan the QR code, then enter the 6-digit code shown in the app.';
+
+  const qrContainer = document.createElement('div');
+  qrContainer.className = 'qr-wrap';
+
+  const qrImage = document.createElement('img');
+  qrImage.id = 'otp-qr';
+  qrImage.alt = 'Google Authenticator QR code';
+  qrImage.className = 'qr-image';
+
+  const form = document.createElement('form');
+  form.id = 'otp-setup-form';
+
+  const codeInput = document.createElement('input');
+  codeInput.name = 'otp';
+  codeInput.type = 'text';
+  codeInput.inputMode = 'numeric';
+  codeInput.placeholder = 'Enter 6-digit code';
+  codeInput.required = true;
+  codeInput.maxLength = 6;
+
+  const errorText = document.createElement('p');
+  errorText.id = 'auth-error';
+  errorText.className = 'form-error';
+
+  const button = document.createElement('button');
+  button.type = 'submit';
+  button.className = 'primary-button full-button';
+  button.textContent = 'Verify and finish';
+
+  form.append(codeInput, errorText, button);
+  form.addEventListener('submit', handleOtpSetupSubmit);
+
+  qrContainer.appendChild(qrImage);
+  wrapper.append(title, description, qrContainer, form);
+  authContent.appendChild(wrapper);
+
+  const uri = makeTotpUri(data.username, data.secret);
+  if (uri) {
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(uri)}&size=220x220`;
+    qrImage.src = qrUrl;
+  }
+}
+
+function renderOtpLoginView(data) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'auth-box';
+
+  const title = document.createElement('h2');
+  title.textContent = 'Authenticator verification';
+
+  const description = document.createElement('p');
+  description.className = 'muted';
+  description.textContent = `Enter the 6-digit code for ${data.username}.`;
+
+  const form = document.createElement('form');
+  form.id = 'otp-login-form';
+
+  const input = document.createElement('input');
+  input.name = 'otp';
+  input.type = 'text';
+  input.inputMode = 'numeric';
+  input.placeholder = 'Enter 6-digit code';
+  input.required = true;
+  input.maxLength = 6;
+
+  const errorText = document.createElement('p');
+  errorText.id = 'auth-error';
+  errorText.className = 'form-error';
+
+  const submit = document.createElement('button');
+  submit.type = 'submit';
+  submit.className = 'primary-button full-button';
+  submit.textContent = 'Verify code';
+
+  form.append(input, errorText, submit);
+  form.addEventListener('submit', handleOtpLoginSubmit);
+
+  wrapper.append(title, description, form);
+  authContent.appendChild(wrapper);
+}
+
+function renderDashboard() {
+  appView.classList.remove('hidden');
+  authView.classList.add('hidden');
+  $('#welcome-user').textContent = `Signed in as ${state.user.username}`;
+  loadEntries();
+}
+
+async function handleCreateSubmit(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const formData = new FormData(form);
-  const username = String(formData.get('username') || '').trim();
-  const firebasePassword = String(formData.get('firebasePassword') || '').trim();
-  const masterPassword = String(formData.get('masterPassword') || '').trim();
+  const username = normalizeUsername(formData.get('username'));
+  const password = safeText(formData.get('password'));
 
-  if (!username || !firebasePassword || !masterPassword) {
-    const errorBox = $('#auth-error');
-    if (errorBox) {
-      errorBox.textContent = 'Username, Firebase password, and master password are required.';
-    }
+  if (!username || username.length < 3) {
+    $('#auth-error').textContent = 'Username must be at least 3 characters.';
+    return;
+  }
+
+  if (password.length < 8) {
+    $('#auth-error').textContent = 'Password must be at least 8 characters.';
+    return;
+  }
+
+  const existing = await ensureUserExists(username);
+  if (existing) {
+    $('#auth-error').textContent = 'That username already exists.';
+    return;
+  }
+
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const passwordHash = await derivePasswordHash(password, saltBytes);
+  const secret = getTotpSecret();
+
+  if (!secret) {
+    $('#auth-error').textContent = 'Unable to generate authenticator secret.';
     return;
   }
 
   try {
-    const email = usernameEmail(username);
-    if (authMode === 'setup') {
-      await createUserWithEmailAndPassword(auth, email, firebasePassword);
-    } else {
-      await signInWithEmailAndPassword(auth, email, firebasePassword);
-    }
-
-    state.masterPassword = masterPassword;
-    showApp();
-  } catch (error) {
-    const errorBox = $('#auth-error');
-    if (errorBox) {
-      errorBox.textContent = readableAuthError(error);
-    }
-  }
-}
-
-async function initializeAuthPersistence() {
-  try {
-    await setPersistence(auth, browserLocalPersistence);
-  } catch (_error) {
-    // some browsers restrict persistence
-  }
-
-  onAuthStateChanged(auth, (user) => {
-    if (user) {
-      state.user = user;
-      appView.classList.remove('hidden');
-      authView.classList.add('hidden');
-      $('#welcome-user').textContent = `Signed in as ${user.email.split('@')[0]}`;
-      loadEntries();
-    } else {
-      clearMemorySession();
-      appView.classList.add('hidden');
-      authView.classList.remove('hidden');
-      showAuth();
-    }
-  });
-}
-
-function formatLastView(value) {
-  if (!value) return 'Never opened';
-  const date = value?.seconds ? new Date(value.seconds * 1000) : new Date(value);
-  if (Number.isNaN(date.getTime())) return 'Never opened';
-  return new Intl.DateTimeFormat(undefined, {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  }).format(date);
-}
-
-function sortEntries() {
-  entries.sort((a, b) => {
-    const aStamp = b.updatedAt?.seconds ?? b.lastViewedAt?.seconds ?? 0;
-    const bStamp = a.updatedAt?.seconds ?? a.lastViewedAt?.seconds ?? 0;
-    return aStamp - bStamp;
-  });
-}
-
-function setFormEditable(enabled) {
-  const form = $('#entry-form');
-  if (!form) return;
-
-  const fields = form.querySelectorAll('input, textarea');
-  fields.forEach((field) => {
-    field.readOnly = !enabled;
-    field.disabled = !enabled && editingId !== null;
-  });
-
-  const hasEntry = Boolean(editingId);
-  $('#delete-btn').classList.toggle('hidden', !hasEntry);
-  $('#edit-btn').classList.toggle('hidden', !hasEntry || enabled);
-  $('#cancel-edit-btn').classList.toggle('hidden', !hasEntry || !enabled);
-  $('#save-btn').classList.toggle('hidden', !enabled);
-}
-
-async function loadLocalEntries() {
-  if (!auth.currentUser || !state.masterPassword) return [];
-
-  const rows = await dexieDb.entries.where('userId').equals(auth.currentUser.uid).toArray();
-  const decrypted = [];
-
-  for (const row of rows) {
-    const plain = await decryptEntryRecord(row, state.masterPassword);
-    decrypted.push({
-      id: row.id,
-      userId: row.userId,
-      label: plain.label,
-      username: plain.username,
-      password: plain.password,
-      remark: plain.remark,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
-      lastViewedAt: row.lastViewedAt,
+    const userDocRef = doc(db, 'users', username);
+    const now = new Date();
+    await setDoc(userDocRef, {
+      username,
+      passwordHash,
+      passwordSalt: Array.from(saltBytes).map((value) => value.toString(16).padStart(2, '0')).join(''),
+      otpSecret: secret,
+      otpEnabled: false,
+      createdAt: now,
+      updatedAt: now,
     });
-  }
 
-  return decrypted;
+    state.pendingSetup = { id: username, username, secret };
+    showAuth('otp-setup');
+  } catch (_error) {
+    $('#auth-error').textContent = 'Could not create account. Please try again.';
+  }
 }
 
-async function loadEntries() {
-  if (!auth.currentUser || !state.masterPassword) return;
+async function handleOtpSetupSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const formData = new FormData(form);
+  const code = String(formData.get('otp') || '').trim();
 
-  try {
-    const snapshot = await getDocs(entriesRef());
-    const cloudEntries = [];
-
-    for (const document of snapshot.docs) {
-      const data = document.data();
-      if (data.userId !== auth.currentUser.uid) continue;
-      const plain = await decryptEntryRecord(data, state.masterPassword);
-      cloudEntries.push({
-        id: document.id,
-        userId: data.userId,
-        label: plain.label,
-        username: plain.username,
-        password: plain.password,
-        remark: plain.remark,
-        createdAt: data.createdAt,
-        updatedAt: data.updatedAt,
-        lastViewedAt: data.lastViewedAt,
-      });
-    }
-
-    entries = cloudEntries.length ? cloudEntries : await loadLocalEntries();
-  } catch (_error) {
-    entries = await loadLocalEntries();
+  if (!state.pendingSetup) {
+    $('#auth-error').textContent = 'No pending setup found.';
+    return;
   }
 
-  sortEntries();
-  renderEntries();
-  $('#total-count').textContent = String(entries.length);
-  const newest = entries[0]?.updatedAt?.seconds ? new Date(entries[0].updatedAt.seconds * 1000) : null;
-  $('#last-updated').textContent = newest ? newest.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '—';
+  const valid = await verifyTotp(state.pendingSetup.secret, code);
+  if (!valid) {
+    $('#auth-error').textContent = 'The authenticator code is invalid.';
+    return;
+  }
+
+  try {
+    const recordRef = doc(db, 'users', state.pendingSetup.id);
+    await updateDoc(recordRef, {
+      otpEnabled: true,
+      updatedAt: new Date(),
+    });
+
+    state.user = { id: state.pendingSetup.id, username: state.pendingSetup.username };
+    state.pendingSetup = null;
+    startAutoLogout();
+    renderDashboard();
+  } catch (_error) {
+    $('#auth-error').textContent = 'Could not confirm setup. Please try again.';
+  }
+}
+
+async function handleLoginSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const formData = new FormData(form);
+  const username = normalizeUsername(formData.get('username'));
+  const password = safeText(formData.get('password'));
+
+  const errorBox = $('#auth-error');
+  if (!username || !password) {
+    errorBox.textContent = 'Username and password are required.';
+    return;
+  }
+
+  const userRecord = await ensureUserExists(username);
+  if (!userRecord) {
+    errorBox.textContent = 'Invalid username or password.';
+    return;
+  }
+
+  const computedHash = await derivePasswordHash(password, hexToBytes(userRecord.passwordSalt || ''));
+  if (computedHash !== (userRecord.passwordHash || '')) {
+    errorBox.textContent = 'Invalid username or password.';
+    return;
+  }
+
+  if (!userRecord.otpEnabled) {
+    errorBox.textContent = 'This account has not finished Google Authenticator setup.';
+    return;
+  }
+
+  state.pendingLogin = { id: userRecord.id, username, secret: userRecord.otpSecret };
+  showAuth('otp-login');
+}
+
+async function handleOtpLoginSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const formData = new FormData(form);
+  const code = String(formData.get('otp') || '').trim();
+
+  if (!state.pendingLogin) {
+    $('#auth-error').textContent = 'No login in progress.';
+    return;
+  }
+
+  const valid = await verifyTotp(state.pendingLogin.secret, code);
+  if (!valid) {
+    $('#auth-error').textContent = 'The authenticator code is invalid.';
+    return;
+  }
+
+  state.user = { id: state.pendingLogin.id, username: state.pendingLogin.username };
+  state.pendingLogin = null;
+  startAutoLogout();
+  renderDashboard();
+}
+
+function compareEntries(a, b) {
+  const av = a.lastViewedAt || a.updatedAt || 0;
+  const bv = b.lastViewedAt || b.updatedAt || 0;
+  return Number(bv) - Number(av);
 }
 
 function renderEntries() {
-  const term = $('#search-input').value.trim().toLowerCase();
-  const visible = entries.filter(({ label, username, remark }) => `${label || ''} ${username || ''} ${remark || ''}`.toLowerCase().includes(term));
   const grid = $('#entries-grid');
-  grid.replaceChildren();
+  if (!grid) return;
+  grid.innerHTML = '';
 
-  if (!visible.length) {
+  if (!entries.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-
-    const icon = document.createElement('div');
-    icon.className = 'empty-icon';
-    icon.textContent = '+';
-
-    const title = document.createElement('h3');
-    title.textContent = term ? 'No matches found' : 'Your vault is empty';
-
-    const desc = document.createElement('p');
-    desc.textContent = term ? 'Try a different search.' : 'Add your first password to get started.';
-
-    empty.append(icon, title, desc);
+    empty.innerHTML = '<div class="empty-icon">+</div><h3>Your vault is empty</h3><p>Add your first password to get started.</p>';
     grid.appendChild(empty);
     return;
   }
 
-  for (const entry of visible) {
+  entries.sort(compareEntries);
+  for (const entry of entries) {
     const card = document.createElement('article');
     card.className = 'entry-card';
 
     const icon = document.createElement('div');
     icon.className = 'entry-icon';
-    icon.textContent = (entry.label || 'V').charAt(0).toUpperCase();
+    icon.textContent = (entry.label || 'V').substr(0, 1).toUpperCase();
 
     const main = document.createElement('div');
     main.className = 'entry-main';
@@ -498,177 +675,179 @@ function renderEntries() {
     const heading = document.createElement('h4');
     heading.textContent = entry.label || 'Untitled';
 
-    const username = document.createElement('p');
-    username.textContent = entry.username || 'No username';
+    const subtitle = document.createElement('p');
+    subtitle.textContent = entry.username || 'No username';
 
     const meta = document.createElement('span');
     meta.className = 'entry-meta';
-    meta.textContent = `Last viewed: ${formatLastView(entry.lastViewedAt)}`;
+    meta.textContent = `Last viewed: ${formatDisplayDate(entry.lastViewedAt)}`;
 
-    main.append(heading, username, meta);
+    main.append(heading, subtitle, meta);
 
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'open-button';
-    button.dataset.id = String(entry.id);
-    button.textContent = 'Open ';
-
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'open-button';
+    openBtn.textContent = 'Open ';
     const arrow = document.createElement('span');
     arrow.textContent = '→';
-    button.appendChild(arrow);
-    button.addEventListener('click', () => openEntry(entry.id));
+    openBtn.appendChild(arrow);
+    openBtn.addEventListener('click', () => openEntry(entry.id));
 
-    card.append(icon, main, button);
+    card.append(icon, main, openBtn);
     grid.appendChild(card);
   }
 }
 
-function openModal(entry) {
-  const form = $('#entry-form');
-  editingId = entry?.id || null;
-  $('#modal-kicker').textContent = entry ? 'EDIT ENTRY' : 'NEW ENTRY';
-  $('#modal-title').textContent = entry ? 'Edit password' : 'Add a password';
-  form.reset();
+async function markEntryViewed(entryId) {
+  if (!state.user || !entryId) return;
+  const entryRef = doc(db, 'users', state.user.id, 'entries', entryId);
+  const now = new Date();
+  await updateDoc(entryRef, { lastViewedAt: now, updatedAt: now });
 
-  if (entry) {
-    for (const [key, value] of Object.entries(entry)) {
-      const field = form.elements[key];
-      if (field && typeof value === 'string') field.value = value;
-    }
-    setFormEditable(false);
-  } else {
-    setFormEditable(true);
+  const target = entries.find((item) => item.id === entryId);
+  if (target) {
+    target.lastViewedAt = now;
+    target.updatedAt = now;
   }
-
-  $('#form-error').textContent = '';
-  $('#modal').classList.remove('hidden');
-  form.elements.label.focus();
-}
-
-async function openEntry(id) {
-  const model = entries.find((item) => item.id === id);
-  if (!model) return;
-
-  openModal({ ...model });
-
-  const now = { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 };
-  entries = entries.map((item) => (item.id === id ? { ...item, lastViewedAt: now } : item));
   renderEntries();
-
-  try {
-    await updateDoc(doc(db, 'users', auth.currentUser.uid, 'entries', id), {
-      lastViewedAt: serverTimestamp(),
-    });
-  } catch (_error) {
-    // use the local view timestamp even if the cloud update fails
-  }
 }
 
-function showApp() {
-  if (!auth.currentUser) return;
-  appView.classList.remove('hidden');
-  authView.classList.add('hidden');
-  $('#welcome-user').textContent = `Signed in as ${auth.currentUser.email.split('@')[0]}`;
-  loadEntries();
-}
-
-$('#add-btn').addEventListener('click', () => {
-  editingId = null;
-  openModal();
-});
-$('#close-modal').addEventListener('click', () => $('#modal').classList.add('hidden'));
-$('.modal-backdrop').addEventListener('click', () => $('#modal').classList.add('hidden'));
-$('#search-input').addEventListener('input', renderEntries);
-
-$('#edit-btn').addEventListener('click', () => {
-  setFormEditable(true);
-  const entry = entries.find((item) => item.id === editingId);
-  if (entry) openModal(entry);
-});
-
-$('#cancel-edit-btn').addEventListener('click', () => {
-  const entry = entries.find((item) => item.id === editingId);
-  if (entry) openModal(entry);
-});
-
-$('#logout-btn').addEventListener('click', async () => {
-  await signOut(auth);
-  clearMemorySession();
-});
-
-$('#delete-btn').addEventListener('click', async () => {
-  if (!editingId || !confirm('Delete this password permanently?')) return;
-  await deleteDoc(doc(db, 'users', auth.currentUser.uid, 'entries', editingId));
+function resetEntryForm() {
+  const form = $('#entry-form');
+  if (!form) return;
+  form.reset();
+  const passwordInput = form.querySelector('input[name="password"]');
+  if (passwordInput) passwordInput.type = 'password';
+  const revealButton = form.querySelector('.reveal-button');
+  if (revealButton) revealButton.textContent = 'Show';
+  $('#form-error').textContent = '';
+  $('#delete-btn').classList.add('hidden');
+  $('#edit-btn').classList.add('hidden');
+  $('#cancel-edit-btn').classList.add('hidden');
   $('#modal').classList.add('hidden');
-  await loadEntries();
-});
+}
 
-$('.reveal-button').addEventListener('click', (event) => {
-  const button = event.currentTarget;
-  const input = button.previousElementSibling;
-  input.type = input.type === 'password' ? 'text' : 'password';
-  button.textContent = input.type === 'password' ? 'Show' : 'Hide';
-});
-
-$('#entry-form').addEventListener('submit', async (event) => {
+async function handleEntrySubmit(event) {
   event.preventDefault();
-  const formData = new FormData(event.currentTarget);
-  const payload = {
-    label: String(formData.get('label') || '').trim(),
-    username: String(formData.get('username') || '').trim(),
-    password: String(formData.get('password') || '').trim(),
-    remark: String(formData.get('remark') || '').trim(),
-  };
+  if (!state.user) return;
 
-  if (!payload.label || !payload.username || !payload.password) {
-    $('#form-error').textContent = 'URL, username, and password are required.';
+  const form = event.currentTarget;
+  const formData = new FormData(form);
+  const label = safeText(formData.get('label')).trim();
+  const username = safeText(formData.get('username')).trim();
+  const password = safeText(formData.get('password')).trim();
+  const remark = safeText(formData.get('remark')).trim();
+  const errorBox = $('#form-error');
+
+  if (!label || !username || !password) {
+    errorBox.textContent = 'Label, username, and password are required.';
     return;
   }
 
   try {
-    const encrypted = await encryptEntryRecord(payload, state.masterPassword);
-    const record = {
-      userId: auth.currentUser.uid,
-      label: encrypted.label,
-      username: encrypted.username,
-      password: encrypted.password,
-      remark: encrypted.remark,
-      version: 1,
-      updatedAt: serverTimestamp(),
-    };
-
+    const now = new Date();
     if (editingId) {
-      await updateDoc(doc(db, 'users', auth.currentUser.uid, 'entries', editingId), record);
-    } else {
-      const created = await addDoc(entriesRef(), {
-        ...record,
-        createdAt: serverTimestamp(),
+      const recordRef = doc(db, 'users', state.user.id, 'entries', editingId);
+      await updateDoc(recordRef, {
+        label,
+        username,
+        password,
+        remark,
+        updatedAt: now,
       });
-
-      await dexieDb.entries.add({
-        userId: auth.currentUser.uid,
-        label: encrypted.label,
-        username: encrypted.username,
-        password: encrypted.password,
-        remark: encrypted.remark,
-        createdAt: new Date(),
-        updatedAt: new Date(),
+      const target = entries.find((entry) => entry.id === editingId);
+      if (target) {
+        Object.assign(target, { label, username, password, remark, updatedAt: now });
+      }
+    } else {
+      await addDoc(collection(db, 'users', state.user.id, 'entries'), {
+        userId: state.user.id,
+        label,
+        username,
+        password,
+        remark,
+        createdAt: now,
+        updatedAt: now,
         lastViewedAt: null,
-        firestoreId: created.id,
+        version: 1,
       });
     }
 
-    $('#modal').classList.add('hidden');
     await loadEntries();
+    resetEntryForm();
   } catch (_error) {
-    $('#form-error').textContent = 'Could not save this entry. Check your browser security settings and Firebase configuration.';
+    errorBox.textContent = 'Could not save this entry. Please try again.';
   }
+}
+
+async function openEntry(id) {
+  const entry = entries.find((item) => item.id === id);
+  if (!entry) return;
+  editingId = id;
+
+  const form = $('#entry-form');
+  form.elements.label.value = entry.label || '';
+  form.elements.username.value = entry.username || '';
+  form.elements.password.value = entry.password || '';
+  form.elements.remark.value = entry.remark || '';
+
+  $('#modal-kicker').textContent = 'EDIT ENTRY';
+  $('#modal-title').textContent = 'Open password';
+  $('#delete-btn').classList.remove('hidden');
+  $('#edit-btn').classList.remove('hidden');
+  $('#cancel-edit-btn').classList.remove('hidden');
+  $('#modal').classList.remove('hidden');
+
+  await markEntryViewed(id);
+}
+
+async function deleteEntry() {
+  if (!state.user || !editingId) return;
+  try {
+    const recordRef = doc(db, 'users', state.user.id, 'entries', editingId);
+    await deleteDoc(recordRef);
+    const index = entries.findIndex((entry) => entry.id === editingId);
+    if (index >= 0) entries.splice(index, 1);
+    await loadEntries();
+    resetEntryForm();
+  } catch (_error) {
+    $('#form-error').textContent = 'Could not delete this entry.';
+  }
+}
+
+$('#add-btn').addEventListener('click', () => {
+  editingId = null;
+  $('#modal-kicker').textContent = 'NEW ENTRY';
+  $('#modal-title').textContent = 'Add a password';
+  $('#form-error').textContent = '';
+  $('#delete-btn').classList.add('hidden');
+  $('#edit-btn').classList.add('hidden');
+  $('#cancel-edit-btn').classList.add('hidden');
+  $('#entry-form').reset();
+  $('#modal').classList.remove('hidden');
+});
+$('#close-modal').addEventListener('click', () => resetEntryForm());
+$('#logout-btn').addEventListener('click', () => {
+  clearUserSession();
+  showAuth('login');
+});
+$('#delete-btn').addEventListener('click', deleteEntry);
+$('#edit-btn').addEventListener('click', () => {
+  $('#entry-form').requestSubmit();
+});
+$('#cancel-edit-btn').addEventListener('click', () => resetEntryForm());
+$('#entry-form').addEventListener('submit', handleEntrySubmit);
+$('#entry-form .reveal-button')?.addEventListener('click', () => {
+  const input = $('#entry-form input[name="password"]');
+  const pressed = input.type === 'password';
+  input.type = pressed ? 'text' : 'password';
+  $('#entry-form .reveal-button').textContent = pressed ? 'Hide' : 'Show';
 });
 
 const infoContent = {
-  privacy: ['Privacy policy', '<p>PassVault stores only encrypted data and never stores raw passwords in plain text.</p><p>All secrets are protected by a PBKDF2-derived key in memory for the current session only.</p>'],
-  terms: ['Terms of service', '<p>PassVault is provided for personal credential storage and management. You remain responsible for keeping your master password private.</p>'],
-  contact: ['Contact us', '<p>For support, contact PrasaTek System Solutions.</p><p><a class="contact-link" href="mailto:info@prasatek.lk">info@prasatek.lk</a></p>'],
+  privacy: ['Privacy policy', '<p>Access is protected by username, password, and Google Authenticator verification.</p>'],
+  terms: ['Terms of service', '<p>This vault is for personal credential management only.</p>'],
+  contact: ['Contact us', '<p>Contact PrasaTek System Solutions for support.</p>'],
 };
 
 document.querySelectorAll('[data-info]').forEach((link) => {
@@ -681,7 +860,8 @@ document.querySelectorAll('[data-info]').forEach((link) => {
   });
 });
 $('#close-info').addEventListener('click', () => $('#info-modal').classList.add('hidden'));
+
 document.querySelector('#info-modal .modal-backdrop').addEventListener('click', () => $('#info-modal').classList.add('hidden'));
 
 initializeTheme();
-initializeAuthPersistence();
+showAuth('login');

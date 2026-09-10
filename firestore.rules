@@ -2,29 +2,28 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /users/{userId}/entries/{entryId} {
-      allow create: if isAuthenticated()
-        && request.auth.uid == userId
-        && request.resource.data.userId == request.auth.uid
-        && validEntry(request.resource.data);
-
-      allow read: if isAuthenticated()
-        && request.auth.uid == userId
-        && resource.data.userId == request.auth.uid;
-
-      allow update: if isAuthenticated()
-        && request.auth.uid == userId
-        && resource.data.userId == request.auth.uid
-        && request.resource.data.userId == request.auth.uid
-        && validEntry(request.resource.data);
-
-      allow delete: if isAuthenticated()
-        && request.auth.uid == userId
-        && resource.data.userId == request.auth.uid;
+    match /users/{userId} {
+      allow create: if isValidUser(request.resource.data, userId);
+      allow read: if true;
+      allow update: if isValidUser(request.resource.data, userId);
+      allow delete: if true;
     }
 
-    function isAuthenticated() {
-      return request.auth != null;
+    match /users/{userId}/entries/{entryId} {
+      allow create: if request.resource.data.userId == userId && validEntry(request.resource.data);
+      allow read: if true;
+      allow update: if request.resource.data.userId == userId && validEntry(request.resource.data);
+      allow delete: if true;
+    }
+
+    function isValidUser(data, userId) {
+      return data.username == userId
+        && data.passwordHash is string
+        && data.passwordSalt is string
+        && data.otpSecret is string
+        && data.otpEnabled is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
     }
 
     function validEntry(data) {
@@ -32,7 +31,7 @@ service cloud.firestore {
         'userId', 'label', 'username', 'password', 'remark',
         'createdAt', 'updatedAt', 'lastViewedAt', 'version'
       ])
-        && data.userId == request.auth.uid
+        && data.userId is string && data.userId.size() > 0
         && data.label is string && data.label.size() > 0 && data.label.size() <= 2048
         && data.username is string && data.username.size() > 0 && data.username.size() <= 2048
         && data.password is string && data.password.size() > 0 && data.password.size() <= 4096
