@@ -12,7 +12,7 @@ service cloud.firestore {
     }
 
     function validEntry(data) {
-      return data.keys().hasOnly(['label', 'username', 'password', 'remark', 'createdAt', 'updatedAt'])
+      return data.keys().hasOnly(['label', 'username', 'password', 'remark', 'createdAt', 'updatedAt', 'lastViewedAt'])
         && data.label is string && data.label.size() > 0 && data.label.size() <= 2048
         && data.username is string && data.username.size() > 0 && data.username.size() <= 2048
         && data.password is string && data.password.size() > 0 && data.password.size() <= 2048
