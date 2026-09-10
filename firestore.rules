@@ -3,20 +3,43 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     match /users/{userId}/entries/{entryId} {
-      allow read, delete: if isOwner(userId);
-      allow create, update: if isOwner(userId) && validEntry(request.resource.data);
+      allow create: if isAuthenticated()
+        && request.auth.uid == userId
+        && request.resource.data.userId == request.auth.uid
+        && validEntry(request.resource.data);
+
+      allow read: if isAuthenticated()
+        && request.auth.uid == userId
+        && resource.data.userId == request.auth.uid;
+
+      allow update: if isAuthenticated()
+        && request.auth.uid == userId
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && validEntry(request.resource.data);
+
+      allow delete: if isAuthenticated()
+        && request.auth.uid == userId
+        && resource.data.userId == request.auth.uid;
     }
 
-    function isOwner(userId) {
-      return request.auth != null && request.auth.uid == userId;
+    function isAuthenticated() {
+      return request.auth != null;
     }
 
     function validEntry(data) {
-      return data.keys().hasOnly(['label', 'username', 'password', 'remark', 'createdAt', 'updatedAt', 'lastViewedAt'])
+      return data.keys().hasOnly([
+        'userId', 'label', 'username', 'password', 'remark',
+        'createdAt', 'updatedAt', 'lastViewedAt', 'version'
+      ])
+        && data.userId == request.auth.uid
         && data.label is string && data.label.size() > 0 && data.label.size() <= 2048
         && data.username is string && data.username.size() > 0 && data.username.size() <= 2048
-        && data.password is string && data.password.size() > 0 && data.password.size() <= 2048
-        && data.remark is string && data.remark.size() <= 2048;
+        && data.password is string && data.password.size() > 0 && data.password.size() <= 4096
+        && data.remark is string && data.remark.size() <= 4096
+        && data.version is number
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
     }
   }
 }
