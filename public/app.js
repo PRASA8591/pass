@@ -1,12 +1,30 @@
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js';
 import { getAnalytics } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-analytics.js';
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-auth.js';
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, setPersistence, browserLocalPersistence } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-auth.js';
 import { getFirestore, collection, addDoc, getDocs, getDoc, doc, updateDoc, deleteDoc, serverTimestamp } from 'https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js';
 
 const firebaseConfig = { apiKey: 'AIzaSyCB2SHj9ffusZoP2PI_wGlbXG3xZahk_dI', authDomain: 'mypassword-5e734.firebaseapp.com', projectId: 'mypassword-5e734', storageBucket: 'mypassword-5e734.firebasestorage.app', messagingSenderId: '13145555075', appId: '1:13145555075:web:de5740f087981b86c69bb6', measurementId: 'G-4D8VN1E901' };
 const firebaseApp = initializeApp(firebaseConfig); try { getAnalytics(firebaseApp); } catch { /* Analytics may be unavailable on local hosts. */ }
 const auth = getAuth(firebaseApp); const db = getFirestore(firebaseApp);
 const $ = (selector) => document.querySelector(selector); const authView = $('#auth-view'); const appView = $('#app-view'); const authContent = $('#auth-content'); const THEME_KEY = 'pass-theme'; let entries = []; let editingId = null; let authMode = 'login'; let isEntryEditMode = false;
+
+async function initializeAuthPersistence() {
+  try {
+    await setPersistence(auth, browserLocalPersistence);
+  } catch (error) {
+    console.warn('Auth persistence could not be enabled:', error);
+  }
+
+  onAuthStateChanged(auth, (user) => {
+    if (user) {
+      showApp();
+    } else {
+      appView.classList.add('hidden');
+      authView.classList.remove('hidden');
+      showAuth();
+    }
+  });
+}
 
 function applyTheme(theme) {
   const nextTheme = theme === 'dark' ? 'dark' : 'light';
@@ -234,4 +252,4 @@ $('#delete-btn').addEventListener('click', async () => { if (!editingId || !conf
 const infoContent = { privacy: ['Privacy policy', '<p>PassVault stores your account and password entries in Firebase services connected to this project. Your entries are protected by Firebase Authentication and owner-only Firestore rules.</p><p>We do not sell or share your vault data. Keep your master password private and sign out on shared devices.</p>'], terms: ['Terms of service', '<p>PassVault is provided for personal credential management. You are responsible for the accuracy of entries and for protecting your account credentials.</p><p>Use the service lawfully and do not share access to your private vault.</p>'], contact: ['Contact us', '<p>For support about this PassVault installation, contact PrasaTek System Solutions.</p><p><a class="contact-link" href="mailto:info@prasatek.lk">info@prasatek.lk</a></p><p><a class="contact-link" href="https://time.prasatek.lk/" target="_blank" rel="noreferrer">time.prasatek.lk</a></p>'] };
 document.querySelectorAll('[data-info]').forEach((link) => link.addEventListener('click', (event) => { event.preventDefault(); const [title, content] = infoContent[link.dataset.info]; $('#info-title').textContent = title; $('#info-content').innerHTML = content; $('#info-modal').classList.remove('hidden'); })); $('#close-info').addEventListener('click', () => $('#info-modal').classList.add('hidden')); document.querySelector('#info-modal .modal-backdrop').addEventListener('click', () => $('#info-modal').classList.add('hidden'));
 initializeTheme();
-onAuthStateChanged(auth, (user) => { if (user) showApp(); else { appView.classList.add('hidden'); authView.classList.remove('hidden'); showAuth(); } });
+initializeAuthPersistence();
